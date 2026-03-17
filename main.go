@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,9 +13,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/imroc/req/v3"
 )
 
 const (
@@ -36,6 +38,8 @@ type config struct {
 	ModelCacheFile string
 	ModelCacheTTL  time.Duration
 	NewConvRSC     string
+	BlockingMode   bool
+	RPM            int
 }
 
 func loadConfig() (*config, error) {
@@ -49,6 +53,8 @@ func loadConfig() (*config, error) {
 		ModelCacheFile: getEnv("OUTLIER_MODELS_CACHE_FILE", "models_cache.json"),
 		ModelCacheTTL:  parseDurationEnv("OUTLIER_MODELS_CACHE_TTL", 0),
 		NewConvRSC:     strings.TrimSpace(getEnv("OUTLIER_NEW_CONV_RSC", "1h3ay")),
+		BlockingMode:   parseBoolEnv("OUTLIER_BLOCKING_MODE", false),
+		RPM:            parseIntEnv("OUTLIER_RPM", 0),
 	}
 
 	if c.Cookie == "" {
@@ -62,6 +68,10 @@ func loadConfig() (*config, error) {
 	}
 	if c.Referer == "" {
 		c.Referer = c.BaseURL + "/"
+	}
+	if c.RPM < 0 {
+		log.Printf("invalid OUTLIER_RPM=%d, fallback to 0", c.RPM)
+		c.RPM = 0
 	}
 	return c, nil
 }
@@ -84,6 +94,35 @@ func parseDurationEnv(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+func parseBoolEnv(key string, fallback bool) bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if raw == "" {
+		return fallback
+	}
+	switch raw {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		log.Printf("invalid %s=%q, fallback to %t", key, raw, fallback)
+		return fallback
+	}
+}
+
+func parseIntEnv(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("invalid %s=%q, fallback to %d", key, raw, fallback)
+		return fallback
+	}
+	return n
 }
 
 func formatTTL(d time.Duration) string {
@@ -221,6 +260,55 @@ type modelCache struct {
 	byEndpoint  map[string]outlierModel
 }
 
+type rpmLimiter struct {
+	mu          sync.Mutex
+	rpm         int
+	windowStart time.Time
+	count       int
+}
+
+func newRPMLimiter(rpm int) *rpmLimiter {
+	if rpm <= 0 {
+		return nil
+	}
+	return &rpmLimiter{rpm: rpm}
+}
+
+func (l *rpmLimiter) allow(now time.Time) (bool, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.windowStart.IsZero() || now.Sub(l.windowStart) >= time.Minute {
+		l.windowStart = now
+		l.count = 0
+	}
+	if l.count >= l.rpm {
+		retryAfter := int(time.Until(l.windowStart.Add(time.Minute)).Seconds())
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
+		return false, retryAfter
+	}
+	l.count++
+	return true, 0
+}
+
+type sessionState struct {
+	semaphore chan struct{}
+	limiter   *rpmLimiter
+}
+
+func newSessionState(cfg *config) *sessionState {
+	s := &sessionState{
+		limiter: newRPMLimiter(cfg.RPM),
+	}
+	if cfg.BlockingMode {
+		s.semaphore = make(chan struct{}, 1)
+		s.semaphore <- struct{}{}
+	}
+	return s
+}
+
 func newModelCache(ttl time.Duration) *modelCache {
 	return &modelCache{
 		ttl:        ttl,
@@ -278,7 +366,7 @@ func (m *modelCache) meta() (int, time.Time) {
 
 type outlierClient struct {
 	cfg        *config
-	httpClient *http.Client
+	reqClient  *req.Client
 	models     *modelCache
 	authMu     sync.RWMutex
 	authCookie string
@@ -286,18 +374,23 @@ type outlierClient struct {
 }
 
 func newOutlierClient(cfg *config) *outlierClient {
-	tr := &http.Transport{
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 100,
-		MaxConnsPerHost:     100,
-		IdleConnTimeout:     120 * time.Second,
-	}
+	rc := req.C().
+		ImpersonateChrome().
+		SetBaseURL(cfg.BaseURL).
+		SetTimeout(cfg.Timeout)
+	rc.Transport.SetResponseHeaderTimeout(10 * time.Second)
+	rc.SetCommonHeaders(map[string]string{
+		"accept":             "application/json, text/event-stream, */*",
+		"accept-language":    "en-US,en;q=0.9",
+		"origin":             cfg.Origin,
+		"referer":            cfg.Referer,
+		"sec-ch-ua":          `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
+		"sec-ch-ua-mobile":   "?0",
+		"sec-ch-ua-platform": `"Windows"`,
+	})
 	return &outlierClient{
-		cfg: cfg,
-		httpClient: &http.Client{
-			Timeout:   cfg.Timeout,
-			Transport: tr,
-		},
+		cfg:        cfg,
+		reqClient:  rc,
 		models:     newModelCache(cfg.ModelCacheTTL),
 		authCookie: cfg.Cookie,
 		authUA:     cfg.UserAgent,
@@ -510,46 +603,21 @@ func (c *outlierClient) fetchModels(ctx context.Context) (map[string]outlierMode
 	return byEndpoint, nil
 }
 
-func (c *outlierClient) buildRequest(ctx context.Context, method, path string, body []byte) (*http.Request, error) {
-	url := c.cfg.BaseURL + path
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, url, reader)
-	if err != nil {
-		return nil, err
-	}
-	cookie, ua := c.authValues()
-	req.Header.Set("Cookie", cookie)
-	req.Header.Set("User-Agent", ua)
-	req.Header.Set("Accept", "application/json, text/event-stream, */*")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Origin", c.cfg.Origin)
-	req.Header.Set("Referer", c.cfg.Referer)
-	req.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`)
-	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	return req, nil
-}
-
 func (c *outlierClient) doRaw(ctx context.Context, method, path string, payload any) (*http.Response, error) {
-	var body []byte
-	var err error
+	cookie, ua := c.authValues()
+	r := c.reqClient.R().
+		SetContext(ctx).
+		SetHeader("Cookie", cookie).
+		SetHeader("User-Agent", ua)
 	if payload != nil {
-		body, err = json.Marshal(payload)
-		if err != nil {
-			return nil, err
-		}
+		r.SetHeader("Content-Type", "application/json")
+		r.SetBodyJsonMarshal(payload)
 	}
-	req, err := c.buildRequest(ctx, method, path, body)
+	resp, err := r.Send(method, path)
 	if err != nil {
 		return nil, err
 	}
-	return c.httpClient.Do(req)
+	return resp.Response, nil
 }
 
 func (c *outlierClient) doJSON(ctx context.Context, method, path string, payload any, out any) error {
@@ -627,14 +695,35 @@ type sseChunk struct {
 }
 
 type app struct {
-	cfg    *config
-	client *outlierClient
+	cfg     *config
+	client  *outlierClient
+	session *sessionState
 }
 
 func newApp(cfg *config) *app {
 	return &app{
-		cfg:    cfg,
-		client: newOutlierClient(cfg),
+		cfg:     cfg,
+		client:  newOutlierClient(cfg),
+		session: newSessionState(cfg),
+	}
+}
+
+func (a *app) allowByRPM() (bool, int) {
+	if a.session == nil || a.session.limiter == nil {
+		return true, 0
+	}
+	return a.session.limiter.allow(time.Now())
+}
+
+func (a *app) acquireSemaphore(ctx context.Context) (func(), error) {
+	if a.session == nil || a.session.semaphore == nil {
+		return func() {}, nil
+	}
+	select {
+	case token := <-a.session.semaphore:
+		return func() { a.session.semaphore <- token }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -931,6 +1020,18 @@ func (a *app) chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	if ok, retryAfter := a.allowByRPM(); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("RPM limit exceeded: %d requests/minute", a.cfg.RPM))
+		return
+	}
+	release, err := a.acquireSemaphore(ctx)
+	if err != nil {
+		writeErr(w, http.StatusRequestTimeout, "request canceled while waiting for execution slot")
+		return
+	}
+	defer release()
+
 	if err := a.client.ensureModelCache(ctx); err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -1068,6 +1169,7 @@ func main() {
 	log.Printf("env_file=%s (auth headers reload on each upstream request)", cfg.EnvFile)
 	log.Printf("models_cache_file=%s ttl=%s", cfg.ModelCacheFile, formatTTL(cfg.ModelCacheTTL))
 	log.Printf("new_conversation_rsc=%q", cfg.NewConvRSC)
+	log.Printf("blocking_mode=%t rpm=%d", cfg.BlockingMode, cfg.RPM)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

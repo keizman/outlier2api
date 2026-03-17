@@ -94,6 +94,8 @@ func newTestApp(t *testing.T) (*app, *upstreamCounters, func()) {
 		ModelCacheFile: filepath.Join(t.TempDir(), "models_cache.json"),
 		ModelCacheTTL:  0,
 		NewConvRSC:     "1h3ay",
+		BlockingMode:   false,
+		RPM:            0,
 	}
 	return newApp(cfg), counters, srv.Close
 }
@@ -255,5 +257,124 @@ func TestAuthHeadersReloadedFromEnvFile(t *testing.T) {
 	}
 	if cookies[1] != "cookie-two" || uas[1] != "UA-TWO" {
 		t.Fatalf("unexpected second auth headers: cookie=%q ua=%q", cookies[1], uas[1])
+	}
+}
+
+func TestRPMExceededReturns429(t *testing.T) {
+	a, counters, cleanup := newTestApp(t)
+	defer cleanup()
+	a.cfg.RPM = 1
+	a.session = newSessionState(a.cfg)
+
+	payload := map[string]any{
+		"model":           "qwen3-omni",
+		"conversation_id": "custom-conv",
+		"messages": []map[string]any{
+			{"role": "user", "content": "hello"},
+		},
+	}
+
+	rr1 := postChat(t, a, payload)
+	if rr1.Code != http.StatusOK {
+		t.Fatalf("first request unexpected status: %d body=%s", rr1.Code, rr1.Body.String())
+	}
+
+	rr2 := postChat(t, a, payload)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request expected 429, got %d body=%s", rr2.Code, rr2.Body.String())
+	}
+	if rr2.Header().Get("Retry-After") == "" {
+		t.Fatalf("expected Retry-After header for 429 response")
+	}
+
+	_, _, _, turn := counters.snapshot()
+	if turn != 1 {
+		t.Fatalf("expected only first request to reach turn-streaming, got turn=%d", turn)
+	}
+}
+
+func TestBlockingModeSerializesTurnRequests(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		activeTurns int
+		maxTurns    int
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/internal/experts/assistant/playground-models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":"m1","endpointString":"qwen3-omni","displayName":"Qwen3 Omni","status":"Ok","visibility":"Public","provider":"outlier","inputTypes":["Text"],"outputTypes":["Text"]}]`))
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/internal/experts/assistant/conversations/custom-conv/turn-streaming":
+			mu.Lock()
+			activeTurns++
+			if activeTurns > maxTurns {
+				maxTurns = activeTurns
+			}
+			mu.Unlock()
+
+			time.Sleep(120 * time.Millisecond)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1773719000,\"model\":\"qwen3-omni\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+
+			mu.Lock()
+			activeTurns--
+			mu.Unlock()
+			return
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config{
+		ListenAddr:     ":0",
+		BaseURL:        srv.URL,
+		Cookie:         "_jwt=test",
+		UserAgent:      defaultUA,
+		Origin:         srv.URL,
+		Referer:        srv.URL + "/",
+		Timeout:        15 * time.Second,
+		ModelCacheFile: filepath.Join(t.TempDir(), "models_cache.json"),
+		ModelCacheTTL:  0,
+		NewConvRSC:     "1h3ay",
+		BlockingMode:   true,
+		RPM:            0,
+	}
+	a := newApp(cfg)
+
+	payload := map[string]any{
+		"model":           "qwen3-omni",
+		"conversation_id": "custom-conv",
+		"messages": []map[string]any{
+			{"role": "user", "content": "hello"},
+		},
+	}
+
+	start := make(chan struct{})
+	res := make(chan int, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			rr := postChat(t, a, payload)
+			res <- rr.Code
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(res)
+
+	for code := range res {
+		if code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", code)
+		}
+	}
+	if maxTurns != 1 {
+		t.Fatalf("expected turn-streaming requests to be serialized, max concurrent=%d", maxTurns)
 	}
 }
