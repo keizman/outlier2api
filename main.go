@@ -27,6 +27,7 @@ const (
 type config struct {
 	ListenAddr     string
 	BaseURL        string
+	EnvFile        string
 	Cookie         string
 	UserAgent      string
 	Origin         string
@@ -41,6 +42,7 @@ func loadConfig() (*config, error) {
 	c := &config{
 		ListenAddr:     getEnv("LISTEN_ADDR", ":8080"),
 		BaseURL:        strings.TrimRight(getEnv("OUTLIER_BASE_URL", defaultBaseURL), "/"),
+		EnvFile:        strings.TrimSpace(getEnv("OUTLIER_ENV_FILE", ".env")),
 		Cookie:         strings.TrimSpace(os.Getenv("OUTLIER_COOKIE")),
 		UserAgent:      getEnv("OUTLIER_USER_AGENT", defaultUA),
 		Timeout:        90 * time.Second,
@@ -137,6 +139,47 @@ func loadDotEnv(path string) error {
 		}
 	}
 	return sc.Err()
+}
+
+func readDotEnvAuth(path string) (cookie string, userAgent string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", "", nil
+		}
+		return "", "", err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		if key == "" {
+			continue
+		}
+		val := parseDotEnvValue(parts[1])
+		switch key {
+		case "OUTLIER_COOKIE":
+			cookie = strings.TrimSpace(val)
+		case "OUTLIER_USER_AGENT":
+			userAgent = strings.TrimSpace(val)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", "", err
+	}
+	return cookie, userAgent, nil
 }
 
 type outlierModel struct {
@@ -237,6 +280,9 @@ type outlierClient struct {
 	cfg        *config
 	httpClient *http.Client
 	models     *modelCache
+	authMu     sync.RWMutex
+	authCookie string
+	authUA     string
 }
 
 func newOutlierClient(cfg *config) *outlierClient {
@@ -252,8 +298,41 @@ func newOutlierClient(cfg *config) *outlierClient {
 			Timeout:   cfg.Timeout,
 			Transport: tr,
 		},
-		models: newModelCache(cfg.ModelCacheTTL),
+		models:     newModelCache(cfg.ModelCacheTTL),
+		authCookie: cfg.Cookie,
+		authUA:     cfg.UserAgent,
 	}
+}
+
+func (c *outlierClient) refreshAuthFromEnvFile() {
+	envPath := strings.TrimSpace(c.cfg.EnvFile)
+	if envPath == "" {
+		return
+	}
+	cookie, ua, err := readDotEnvAuth(envPath)
+	if err != nil {
+		log.Printf("auth reload warning: failed to read %s: %v", envPath, err)
+		return
+	}
+	if cookie == "" && ua == "" {
+		return
+	}
+
+	c.authMu.Lock()
+	if cookie != "" {
+		c.authCookie = cookie
+	}
+	if ua != "" {
+		c.authUA = ua
+	}
+	c.authMu.Unlock()
+}
+
+func (c *outlierClient) authValues() (cookie string, userAgent string) {
+	c.refreshAuthFromEnvFile()
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.authCookie, c.authUA
 }
 
 func (c *outlierClient) ensureModelCache(ctx context.Context) error {
@@ -441,8 +520,9 @@ func (c *outlierClient) buildRequest(ctx context.Context, method, path string, b
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Cookie", c.cfg.Cookie)
-	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	cookie, ua := c.authValues()
+	req.Header.Set("Cookie", cookie)
+	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "application/json, text/event-stream, */*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Origin", c.cfg.Origin)
@@ -985,6 +1065,7 @@ func main() {
 
 	log.Printf("outlier-openai-proxy listening on %s", cfg.ListenAddr)
 	log.Printf("base=%s", cfg.BaseURL)
+	log.Printf("env_file=%s (auth headers reload on each upstream request)", cfg.EnvFile)
 	log.Printf("models_cache_file=%s ttl=%s", cfg.ModelCacheFile, formatTTL(cfg.ModelCacheTTL))
 	log.Printf("new_conversation_rsc=%q", cfg.NewConvRSC)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

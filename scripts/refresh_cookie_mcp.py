@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Refresh OUTLIER_COOKIE / OUTLIER_USER_AGENT in .env via Playwright MCP extension transport.
+Refresh OUTLIER_COOKIE / OUTLIER_USER_AGENT in .env via Playwright MCP.
 
-Example:
-  set PLAYWRIGHT_MCP_EXTENSION_TOKEN=...
-  python scripts/refresh_cookie_mcp.py --env .env
+Supported browser connection modes:
+- Extension bridge (--extension mode; requires token)
+- CDP endpoint/port (--cdp mode)
+
+Examples:
+  python scripts/refresh_cookie_mcp.py --env .env --token "$PLAYWRIGHT_MCP_EXTENSION_TOKEN"
+  python scripts/refresh_cookie_mcp.py --env .env --cdp-port 9322
 
 Daemon mode:
-  python scripts/refresh_cookie_mcp.py --daemon --lead-seconds 3600
+  python scripts/refresh_cookie_mcp.py --daemon --lead-seconds 3600 --cdp-port 9322
 """
 
 from __future__ import annotations
@@ -31,8 +35,30 @@ import requests
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Refresh Outlier cookie via Playwright MCP extension")
-    parser.add_argument("--token", default=os.getenv("PLAYWRIGHT_MCP_EXTENSION_TOKEN", ""), help="Playwright MCP extension token")
+    parser = argparse.ArgumentParser(description="Refresh Outlier cookie via Playwright MCP (extension or CDP)")
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "extension", "cdp"),
+        default=os.getenv("PLAYWRIGHT_MCP_MODE", "auto"),
+        help="Browser attach mode. auto=cdp when endpoint/port is provided, otherwise extension.",
+    )
+    parser.add_argument("--token", default=os.getenv("PLAYWRIGHT_MCP_EXTENSION_TOKEN", ""), help="Playwright MCP extension token (extension mode)")
+    parser.add_argument(
+        "--cdp-endpoint",
+        default=os.getenv("PLAYWRIGHT_MCP_CDP_ENDPOINT", ""),
+        help="CDP endpoint for existing Chromium browser, e.g. http://127.0.0.1:9322",
+    )
+    parser.add_argument(
+        "--cdp-host",
+        default=os.getenv("PLAYWRIGHT_MCP_CDP_HOST", "127.0.0.1"),
+        help="CDP host when using --cdp-port",
+    )
+    parser.add_argument(
+        "--cdp-port",
+        type=int,
+        default=int(os.getenv("PLAYWRIGHT_MCP_CDP_PORT", "0") or "0"),
+        help="CDP port when using --cdp mode",
+    )
     parser.add_argument("--env", type=Path, default=Path(".env"), help="Path to .env")
     parser.add_argument("--url", default=os.getenv("OUTLIER_URL", "https://playground.outlier.ai/"), help="Target URL for cookie scope")
     parser.add_argument("--host", default=os.getenv("PLAYWRIGHT_MCP_HOST", "localhost"), help="MCP bind host")
@@ -43,6 +69,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--daemon", action="store_true", help="Run forever and refresh before expiry")
     parser.add_argument("--debug", action="store_true", help="Enable debug logs")
     return parser.parse_args()
+
+
+def resolve_mode(args: argparse.Namespace) -> str:
+    if args.mode in ("extension", "cdp"):
+        return args.mode
+    if args.cdp_endpoint or args.cdp_port > 0:
+        return "cdp"
+    return "extension"
+
+
+def resolve_cdp_endpoint(args: argparse.Namespace) -> str:
+    endpoint = str(args.cdp_endpoint or "").strip()
+    if endpoint:
+        return endpoint
+    if args.cdp_port > 0:
+        host = str(args.cdp_host or "127.0.0.1").strip() or "127.0.0.1"
+        return f"http://{host}:{args.cdp_port}"
+    return ""
 
 
 def decode_jwt_exp(jwt_value: str) -> int:
@@ -146,23 +190,51 @@ class CaptureResult:
 
 
 class MCPServer:
-    def __init__(self, token: str, host: str, port: int, debug: bool = False):
+    def __init__(
+        self,
+        mode: str,
+        token: str,
+        cdp_endpoint: str,
+        host: str,
+        port: int,
+        debug: bool = False,
+    ):
+        self.mode = mode
         self.token = token
+        self.cdp_endpoint = cdp_endpoint
         self.host = host
         self.port = port
         self.debug = debug
         self.proc: subprocess.Popen[str] | None = None
+        self._log_file: Any = None
         self.log_path = Path(tempfile.gettempdir()) / f"outlier_mcp_{os.getpid()}_{self.port}.log"
         self.base_url = f"http://{self.host}:{self.port}/mcp"
 
     def start(self) -> None:
-        cmd = f"npx @playwright/mcp@latest --extension --ignore-https-errors --host {self.host} --port {self.port}"
+        cmd = [
+            "npx",
+            "@playwright/mcp@latest",
+            "--ignore-https-errors",
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+        ]
+        if self.mode == "extension":
+            cmd.append("--extension")
+        elif self.mode == "cdp":
+            cmd.extend(["--cdp-endpoint", self.cdp_endpoint])
+        else:
+            raise RuntimeError(f"unsupported mode: {self.mode}")
+
         env = dict(os.environ)
-        env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = self.token
-        log_file = self.log_path.open("w", encoding="utf-8")
+        if self.mode == "extension":
+            env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = self.token
+
+        self._log_file = self.log_path.open("w", encoding="utf-8")
         self.proc = subprocess.Popen(
-            ["cmd.exe", "/d", "/s", "/c", cmd],
-            stdout=log_file,
+            cmd,
+            stdout=self._log_file,
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
@@ -182,6 +254,12 @@ class MCPServer:
             else:
                 self.proc.terminate()
         self.proc = None
+        if self._log_file:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
 
     def logs(self) -> str:
         try:
@@ -248,7 +326,16 @@ def mcp_post(base_url: str, payload: dict[str, Any], session_id: str = "", timeo
 
 def capture_once(args: argparse.Namespace) -> CaptureResult:
     port = args.port or random.randint(18000, 27999)
-    server = MCPServer(token=args.token, host=args.host, port=port, debug=args.debug)
+    mode = resolve_mode(args)
+    cdp_endpoint = resolve_cdp_endpoint(args)
+    server = MCPServer(
+        mode=mode,
+        token=args.token,
+        cdp_endpoint=cdp_endpoint,
+        host=args.host,
+        port=port,
+        debug=args.debug,
+    )
     server.start()
     try:
         server.ensure_up(args.start_timeout)
@@ -345,14 +432,20 @@ def run_once(args: argparse.Namespace) -> CaptureResult:
 
 def main() -> int:
     args = parse_args()
-    if not args.token:
+    mode = resolve_mode(args)
+    cdp_endpoint = resolve_cdp_endpoint(args)
+    if mode == "extension" and not args.token:
         raise RuntimeError("missing token: set PLAYWRIGHT_MCP_EXTENSION_TOKEN or pass --token")
+    if mode == "cdp" and not cdp_endpoint:
+        raise RuntimeError("missing CDP endpoint: pass --cdp-endpoint or --cdp-port")
     if args.start_timeout <= 0:
         raise RuntimeError("--start-timeout must be > 0")
     if args.poll_seconds <= 0:
         raise RuntimeError("--poll-seconds must be > 0")
     if args.lead_seconds < 0:
         raise RuntimeError("--lead-seconds must be >= 0")
+    if args.cdp_port < 0:
+        raise RuntimeError("--cdp-port must be >= 0")
 
     if not args.daemon:
         run_once(args)

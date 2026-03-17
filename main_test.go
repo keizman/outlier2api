@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -188,5 +190,70 @@ func TestModelCacheNeverExpiresWhenTTLUnset(t *testing.T) {
 
 	if cache.stale() {
 		t.Fatalf("expected cache not stale when ttl=0 and models exist")
+	}
+}
+
+func TestAuthHeadersReloadedFromEnvFile(t *testing.T) {
+	envFile := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envFile, []byte("OUTLIER_COOKIE=\"cookie-one\"\nOUTLIER_USER_AGENT=\"UA-ONE\"\n"), 0o644); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+
+	var (
+		mu      sync.Mutex
+		cookies []string
+		uas     []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cookies = append(cookies, r.Header.Get("Cookie"))
+		uas = append(uas, r.Header.Get("User-Agent"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	cfg := &config{
+		ListenAddr:     ":0",
+		BaseURL:        srv.URL,
+		EnvFile:        envFile,
+		Cookie:         "fallback-cookie",
+		UserAgent:      "fallback-ua",
+		Origin:         srv.URL,
+		Referer:        srv.URL + "/",
+		Timeout:        15 * time.Second,
+		ModelCacheFile: filepath.Join(t.TempDir(), "models_cache.json"),
+		ModelCacheTTL:  0,
+		NewConvRSC:     "1h3ay",
+	}
+	client := newOutlierClient(cfg)
+
+	resp1, err := client.doRaw(context.Background(), http.MethodGet, "/probe-1", nil)
+	if err != nil {
+		t.Fatalf("first doRaw: %v", err)
+	}
+	_ = resp1.Body.Close()
+
+	if err := os.WriteFile(envFile, []byte("OUTLIER_COOKIE=\"cookie-two\"\nOUTLIER_USER_AGENT=\"UA-TWO\"\n"), 0o644); err != nil {
+		t.Fatalf("rewrite env file: %v", err)
+	}
+
+	resp2, err := client.doRaw(context.Background(), http.MethodGet, "/probe-2", nil)
+	if err != nil {
+		t.Fatalf("second doRaw: %v", err)
+	}
+	_ = resp2.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(cookies) != 2 || len(uas) != 2 {
+		t.Fatalf("expected 2 captured requests, got cookies=%d uas=%d", len(cookies), len(uas))
+	}
+	if cookies[0] != "cookie-one" || uas[0] != "UA-ONE" {
+		t.Fatalf("unexpected first auth headers: cookie=%q ua=%q", cookies[0], uas[0])
+	}
+	if cookies[1] != "cookie-two" || uas[1] != "UA-TWO" {
+		t.Fatalf("unexpected second auth headers: cookie=%q ua=%q", cookies[1], uas[1])
 	}
 }

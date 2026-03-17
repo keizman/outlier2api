@@ -32,9 +32,15 @@ Optional:
 - `OUTLIER_USER_AGENT` (default Chrome 146 UA)
 - `OUTLIER_ORIGIN` (default same as base URL)
 - `OUTLIER_REFERER` (default `<base>/`)
+- `OUTLIER_ENV_FILE` (default `.env`; auth reload source file path)
 - `OUTLIER_MODELS_CACHE_FILE` (default `models_cache.json`)
 - `OUTLIER_MODELS_CACHE_TTL` (optional; empty/unset means never expire; format like `30m`, `2h`, `24h`)
 - `OUTLIER_NEW_CONV_RSC` (default `1h3ay`, used for `GET /?_rsc=<value>` preflight on new conversation)
+
+Auth header reload behavior:
+
+- `OUTLIER_COOKIE` and `OUTLIER_USER_AGENT` are re-read from `OUTLIER_ENV_FILE` on every upstream request.
+- After `.env` is refreshed, new requests use the new cookie/UA without restarting Go backend.
 
 Files in this repo:
 
@@ -143,7 +149,7 @@ How to inspect cookie expiry:
 2. Check `Expires / Max-Age` for session-related cookies
 3. If `Session` type cookie (no explicit Expires), it usually expires when browser session ends or server invalidates it
 
-### Auto refresh script (Playwright MCP extension)
+### Auto refresh script (Playwright MCP: extension or CDP)
 
 Script path:
 
@@ -151,23 +157,46 @@ Script path:
 
 Prerequisites:
 
-- Chrome/Edge has **Playwright MCP Bridge** extension installed.
-- MCP extension token is available as env var:
-  - `PLAYWRIGHT_MCP_EXTENSION_TOKEN=...`
 - Python dependency:
   - `pip install requests`
+- Use one of the following browser attach modes:
+  - Extension mode:
+    - Chrome/Edge has **Playwright MCP Bridge** extension installed.
+    - `PLAYWRIGHT_MCP_EXTENSION_TOKEN=...`
+  - CDP mode:
+    - Browser started with remote debug port, e.g.:
+      - `google-chrome --remote-debugging-port=9322 --user-data-dir=/tmp/chrome-9322 --no-sandbox --disable-dev-shm-usage --disable-gpu`
 
-One-time refresh:
+One-time refresh (extension mode):
 
 ```bash
-python scripts/refresh_cookie_mcp.py --env .env --token "$PLAYWRIGHT_MCP_EXTENSION_TOKEN"
+python scripts/refresh_cookie_mcp.py --env .env --mode extension --token "$PLAYWRIGHT_MCP_EXTENSION_TOKEN"
 ```
 
-Daemon mode (refresh before expiry):
+One-time refresh (CDP port mode):
 
 ```bash
-python scripts/refresh_cookie_mcp.py --daemon --env .env --token "$PLAYWRIGHT_MCP_EXTENSION_TOKEN" --lead-seconds 3600
+python scripts/refresh_cookie_mcp.py --env .env --mode cdp --cdp-port 9322
 ```
+
+Daemon mode (refresh before expiry, CDP mode):
+
+```bash
+python scripts/refresh_cookie_mcp.py --daemon --env .env --mode cdp --cdp-port 9322 --lead-seconds 3600
+```
+
+Helper launcher (for `nohup` background use):
+
+```bash
+nohup ./scripts/start_cookie_refresh_daemon.sh > refresh_cookie_daemon.log 2>&1 &
+```
+
+Common launcher env overrides:
+
+- `MODE=cdp|extension|auto` (default `cdp`)
+- `CDP_PORT=9322` or `CDP_ENDPOINT=http://127.0.0.1:9322`
+- `ENV_FILE=/opt/LLM/outlier2api/.env`
+- `LEAD_SECONDS=3600`, `POLL_SECONDS=300`
 
 This script updates:
 
